@@ -11,7 +11,7 @@ import (
 	"log"
 	"math"
 
-	"github.com/yourorg/gonexus/gonexus"
+	"github.com/vkuznet/gonexus/gonexus"
 )
 
 func main() {
