@@ -17,9 +17,44 @@ package gonexus
 // See the README "Known Limitations" section for how to extend this list
 // or plug in a different binding.
 
+// IMPORTANT CAVEAT #2 - variable-length string datasets: the pinned
+// gonum/hdf5 version has a real bug in Dataset.WriteSubset's handling of
+// Go strings (confirmed by reading its source at
+// github.com/gonum/hdf5/blob/master/h5d_dataset.go): for a variable-length
+// string datatype (T_GO_STRING), it writes a pointer directly to the Go
+// string's raw byte data, but HDF5's C API requires the write buffer for a
+// vlen string element to *contain* a `char*` pointer (one more level of
+// indirection) - the mismatch corrupts memory and crashes the process
+// (SIGSEGV inside H5Dwrite). Attribute.Write does NOT have this bug (it
+// correctly C.CString()s the value and passes its address), so attributes
+// are unaffected.
+//
+// gonexus works around this by never writing string *datasets* (i.e.
+// NXfield string values) using T_GO_STRING at all: writeFixedStringDataset
+// below uses a fixed-length HDF5 string type instead, which goes through
+// the (correctly implemented) generic byte-buffer code path already used
+// for numeric arrays. The corresponding reader, readFixedStringDataset,
+// only knows how to decode that same fixed-length convention. This means
+// gonexus round-trips its own files correctly, but reading a string
+// *dataset* (not attribute) from a file written by another NeXus tool
+// (Python's nexusformat/h5py default to variable-length strings) may not
+// decode correctly - see the doc comment on readFixedStringDataset, and
+// the README's "Known Limitations" section.
+
+// IMPORTANT CAVEAT #3 - scalar dataspace detection: Dataspace.IsSimple()
+// (which wraps H5Sis_simple) is not a reliable way to detect a scalar
+// field/attribute - it returns true for H5S_SCALAR dataspaces too, not
+// just H5S_SIMPLE (N-dimensional array) ones. Calling
+// Dataspace.SimpleExtentDims() on a genuinely scalar (0-rank) dataspace
+// panics in this binding version (it indexes a zero-length slice
+// internally). datasetShape() below therefore checks
+// Dataspace.SimpleExtentType() first and only calls SimpleExtentDims()
+// for a confirmed H5S_SIMPLE dataspace.
+
 import (
 	"fmt"
 	"reflect"
+	"strings"
 
 	"gonum.org/v1/hdf5"
 )
@@ -192,7 +227,7 @@ func writeAttributeValue(loc attributable, name string, value interface{}) error
 		return err
 	}
 	defer attr.Close()
-	return attr.Write(value, dtype)
+	return attr.Write(writeReady(value), dtype)
 }
 
 // ---------------------------------------------------------------------
@@ -202,9 +237,21 @@ func writeAttributeValue(loc attributable, name string, value interface{}) error
 func datasetShape(ds *hdf5.Dataset) ([]int, error) {
 	space := ds.Space()
 	defer space.Close()
-	if !space.IsSimple() {
-		return nil, nil // scalar
+
+	// Do NOT rely on IsSimple() to detect a scalar dataspace: it wraps
+	// H5Sis_simple, which in modern HDF5 returns true even for
+	// H5S_SCALAR dataspaces (not just H5S_SIMPLE ones). Calling
+	// SimpleExtentDims() on a genuinely 0-rank (scalar) dataspace panics
+	// in this specific gonum/hdf5 version - it indexes into a
+	// zero-length dims slice internally. So check the dataspace's actual
+	// class first via SimpleExtentType(), and only call
+	// SimpleExtentDims() for a true H5S_SIMPLE (N-dimensional array)
+	// dataspace.
+	switch space.SimpleExtentType() {
+	case hdf5.S_SCALAR, hdf5.S_NULL:
+		return nil, nil // scalar (or empty) field
 	}
+
 	dims, _, err := space.SimpleExtentDims()
 	if err != nil {
 		return nil, err
@@ -236,12 +283,24 @@ func readDatasetValue(ds *hdf5.Dataset, shape []int) (interface{}, string, error
 		return nil, "", err
 	}
 	defer dt.Close()
+
+	// Route ANY string-class dataset - fixed-length or variable-length -
+	// through readFixedStringDataset, and do this check BEFORE looking at
+	// GoType(). Datatype.GoType() maps every T_STRING-class datatype to
+	// Go's `string` type regardless of whether it's fixed or
+	// variable-length (see typeClassToGoType in
+	// github.com/gonum/hdf5/blob/master/h5t_types.go), so relying on
+	// GoType() here would send strings through the generic reflect-based
+	// path below, which shares the same broken low-level string handling
+	// as Dataset.Write (see the file-level comment).
+	if dt.Class() == hdf5.T_STRING {
+		return readFixedStringDataset(ds, dt, shape)
+	}
+
 	goType := dt.GoType()
 	n := numElements(shape)
-
 	if goType == nil {
-		// Fall back to string, the common case for NeXus text fields.
-		return readStringDataset(ds, shape)
+		return nil, "", newError("unsupported HDF5 datatype class %v", dt.Class())
 	}
 
 	slicePtr := reflect.New(reflect.SliceOf(goType))
@@ -259,16 +318,49 @@ func readDatasetValue(ds *hdf5.Dataset, shape []int) (interface{}, string, error
 	return slice, dtype, nil
 }
 
-func readStringDataset(ds *hdf5.Dataset, shape []int) (interface{}, string, error) {
+// readFixedStringDataset reads a string dataset by reading its raw bytes
+// into a buffer sized (element count) x (HDF5 element byte size), then
+// slicing that buffer into fixed-width fields and trimming trailing NUL
+// padding from each. This correctly round-trips string fields written by
+// gonexus itself (see writeFixedStringDataset), which deliberately uses a
+// fixed-length HDF5 string datatype to avoid a Dataset.Write bug in the
+// pinned gonum/hdf5 binding affecting variable-length ("vlen") strings -
+// see the file-level comment above.
+//
+// KNOWN LIMITATION: if the dataset actually uses HDF5's variable-length
+// string encoding - the default h5py/nexusformat uses for text fields, and
+// therefore what most pre-existing, third-party NeXus files on disk will
+// contain - this will not decode it correctly, because the raw bytes of a
+// vlen element are an internal pointer/descriptor, not the characters
+// themselves; you'll get garbage or an error, not a crash (this path only
+// reads into a plain []byte buffer, so it can't corrupt memory the way the
+// write bug could). Properly supporting vlen dataset reads needs a binding
+// capability (checking H5Tis_variable_str, which the binding today calls
+// only internally inside Attribute.Read) that is not currently exposed for
+// datasets. If you need to read text datasets from files written by other
+// tools, see the README's "Known Limitations" section for options.
+func readFixedStringDataset(ds *hdf5.Dataset, dt *hdf5.Datatype, shape []int) (interface{}, string, error) {
+	elemSize := int(dt.Size())
+	if elemSize <= 0 {
+		elemSize = 1
+	}
 	n := numElements(shape)
-	buf := make([]string, n)
-	if err := ds.Read(&buf); err != nil {
-		return nil, "", err
+	buf := make([]byte, n*elemSize)
+	if err := ds.Read(addressable(buf)); err != nil {
+		return nil, "", fmt.Errorf(
+			"reading string dataset (note: variable-length HDF5 strings "+
+				"are not supported for dataset reads - see README "+
+				"Known Limitations): %w", err)
+	}
+	values := make([]string, n)
+	for i := 0; i < n; i++ {
+		raw := buf[i*elemSize : (i+1)*elemSize]
+		values[i] = strings.TrimRight(string(raw), "\x00")
 	}
 	if len(shape) == 0 {
-		return buf[0], "string", nil
+		return values[0], "string", nil
 	}
-	return buf, "string", nil
+	return values, "string", nil
 }
 
 // writeDatasetValue creates a new dataset named `name` under `parent`
@@ -276,6 +368,16 @@ func readStringDataset(ds *hdf5.Dataset, shape []int) (interface{}, string, erro
 func writeDatasetValue(parent container, name string, value interface{}, shape []int) (*hdf5.Dataset, error) {
 	if value == nil {
 		return nil, newError("field has no value to write")
+	}
+
+	// Strings always go through writeFixedStringDataset - see the
+	// file-level comment on why Dataset.Write cannot safely be given a
+	// variable-length string type.
+	switch v := value.(type) {
+	case string:
+		return writeFixedStringDataset(parent, name, []string{v}, nil)
+	case []string:
+		return writeFixedStringDataset(parent, name, v, shape)
 	}
 
 	var sample interface{}
@@ -316,9 +418,99 @@ func writeDatasetValue(parent container, name string, value interface{}, shape [
 		return nil, fmt.Errorf("creating dataset: %w", err)
 	}
 
-	if err := ds.Write(value); err != nil {
+	if err := ds.Write(addressable(value)); err != nil {
 		ds.Close()
 		return nil, fmt.Errorf("writing dataset contents: %w", err)
 	}
 	return ds, nil
+}
+
+// writeFixedStringDataset creates a dataset holding one or more strings
+// using a fixed-length HDF5 string datatype (H5T_C_S1 copied and resized
+// to the longest string present, NUL-padded), instead of the pinned
+// gonum/hdf5 binding's variable-length T_GO_STRING type. See the
+// file-level comment for why: Dataset.WriteSubset mishandles vlen strings
+// in a way that crashes the process, but a fixed-length string is simply N
+// raw bytes per element, which goes through the same generic byte-buffer
+// code path already proven to work for numeric arrays.
+func writeFixedStringDataset(parent container, name string, values []string, shape []int) (*hdf5.Dataset, error) {
+	n := len(values)
+	if n == 0 {
+		return nil, newError("cannot write an empty string array field")
+	}
+	maxLen := 1 // HDF5 rejects a zero-size string datatype; store >=1 byte.
+	for _, s := range values {
+		if len(s) > maxLen {
+			maxLen = len(s)
+		}
+	}
+
+	dtype, err := hdf5.T_C_S1.Copy()
+	if err != nil {
+		return nil, fmt.Errorf("copying string datatype: %w", err)
+	}
+	defer dtype.Close()
+	if err := dtype.SetSize(maxLen); err != nil {
+		return nil, fmt.Errorf("setting string datatype size: %w", err)
+	}
+
+	buf := make([]byte, n*maxLen) // zero-initialized -> NUL-padded strings
+	for i, s := range values {
+		copy(buf[i*maxLen:(i+1)*maxLen], s)
+	}
+
+	var space *hdf5.Dataspace
+	if len(shape) == 0 {
+		space, err = hdf5.CreateDataspace(hdf5.S_SCALAR)
+	} else {
+		dims := make([]uint, len(shape))
+		for i, s := range shape {
+			dims[i] = uint(s)
+		}
+		space, err = hdf5.CreateSimpleDataspace(dims, nil)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("creating dataspace: %w", err)
+	}
+	defer space.Close()
+
+	ds, err := parent.CreateDataset(name, dtype, space)
+	if err != nil {
+		return nil, fmt.Errorf("creating dataset: %w", err)
+	}
+	if err := ds.Write(addressable(buf)); err != nil {
+		ds.Close()
+		return nil, fmt.Errorf("writing string dataset contents: %w", err)
+	}
+	return ds, nil
+}
+
+// addressable returns a pointer to a fresh copy of v with the same
+// concrete type. gonum/hdf5's Dataset.Write calls reflect.Value.UnsafeAddr()
+// internally, which panics unless the value backing the interface{} is
+// addressable - a bare slice or scalar passed directly (e.g.
+// `ds.Write(myFloat64Slice)`) is not, but `*myFloat64Slice` is. This wraps
+// any value (scalar or slice) accordingly; for slices the copy is shallow,
+// so the original backing array's contents are what get written.
+func addressable(v interface{}) interface{} {
+	rv := reflect.ValueOf(v)
+	ptr := reflect.New(rv.Type())
+	ptr.Elem().Set(rv)
+	return ptr.Interface()
+}
+
+// writeReady prepares a value for Attribute.Write, which - unlike
+// Dataset.Write - handles Go strings correctly on its own (its
+// reflect.String case does its own C-string marshaling and works whether
+// it's given a pointer or a bare value). So for attributes, strings can be
+// passed through unwrapped; everything else still needs addressable() so
+// Attribute.Write's fixed-size fallback case (which does call
+// UnsafeAddr()) has something addressable to work with.
+func writeReady(v interface{}) interface{} {
+	switch v.(type) {
+	case string, []string:
+		return v
+	default:
+		return addressable(v)
+	}
 }
