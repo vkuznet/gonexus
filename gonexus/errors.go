@@ -25,3 +25,11 @@ func (e *NeXusError) Error() string {
 func newError(format string, args ...interface{}) *NeXusError {
 	return &NeXusError{Msg: fmt.Sprintf(format, args...)}
 }
+
+// errors.go
+var errVariableLengthString = newError("variable-length HDF5 string not supported for reading")
+
+func isUnsupportedVlenString(err error) bool {
+	ne, ok := err.(*NeXusError)
+	return ok && ne.Msg == errVariableLengthString.Msg
+}

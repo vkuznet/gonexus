@@ -204,9 +204,18 @@ func (nf *NXFile) readDataset(ds *hdf5.Dataset, name string) (*NXfield, error) {
 		return nil, err
 	}
 
-	value, dtype, err := readDatasetValue(ds, shape)
+	value, dtype, err := readDatasetValue(ds, shape, name)
 	if err != nil {
-		return nil, err
+		if isUnsupportedVlenString(err) {
+			// Field exists but this binding can't decode it yet - keep
+			// the rest of the tree loading rather than failing outright.
+			f := NewField(fmt.Sprintf("<unreadable: %s>", err), name)
+			f.Dtype = "string"
+			f.Shape = shape
+			f.attrs = attrs
+			return f, nil
+		}
+		return nil, newError("could not read dataset %q: %v", name, err)
 	}
 
 	f := NewField(value, name)

@@ -55,6 +55,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"unsafe"
 
 	"gonum.org/v1/hdf5"
 )
@@ -277,7 +278,7 @@ func numElements(shape []int) int {
 // readDatasetValue reads a dataset's raw contents into a flat Go slice (or
 // a single scalar, for a zero-length shape), returning the value alongside
 // a NeXus/NumPy-style dtype name.
-func readDatasetValue(ds *hdf5.Dataset, shape []int) (interface{}, string, error) {
+func readDatasetValue(ds *hdf5.Dataset, shape []int, name string) (interface{}, string, error) {
 	dt, err := ds.Datatype()
 	if err != nil {
 		return nil, "", err
@@ -294,13 +295,25 @@ func readDatasetValue(ds *hdf5.Dataset, shape []int) (interface{}, string, error
 	// path below, which shares the same broken low-level string handling
 	// as Dataset.Write (see the file-level comment).
 	if dt.Class() == hdf5.T_STRING {
+		// temp fix to skip unreadable values
+		if int(dt.Size()) == int(unsafe.Sizeof(uintptr(0))) {
+			return nil, "", errVariableLengthString
+		}
+		if int(dt.Size()) == int(unsafe.Sizeof(uintptr(0))) {
+			return nil, "", newError(
+				"dataset %q appears to be a variable-length HDF5 string; "+
+					"not supported for reading by this binding yet", name)
+		}
 		return readFixedStringDataset(ds, dt, shape)
 	}
 
-	goType := dt.GoType()
+	goType := elementGoType(dt)
 	n := numElements(shape)
 	if goType == nil {
 		return nil, "", newError("unsupported HDF5 datatype class %v", dt.Class())
+	}
+	if err := checkElemSize(dt, int(goType.Size()), fmt.Sprintf("dataset of Go type %v", goType)); err != nil {
+		return nil, "", err
 	}
 
 	slicePtr := reflect.New(reflect.SliceOf(goType))
@@ -513,4 +526,74 @@ func writeReady(v interface{}) interface{} {
 	default:
 		return addressable(v)
 	}
+}
+
+// checkElemSize refuses a read instead of letting HDF5 write more bytes
+// per element than the Go buffer was sized for. Without this, a mismatch
+// between what HDF5 reports (dt.Size()) and what Go assumed corrupts
+// unrelated heap memory across the cgo boundary - Go's memory safety
+// doesn't apply to bytes written by C. The corruption doesn't crash
+// immediately; it surfaces later, unpredictably, whenever the GC scans
+// the clobbered region - which is why it looks like a race condition.
+func checkElemSize(dt *hdf5.Datatype, elemGoSize int, context string) error {
+	if h5Size := int(dt.Size()); elemGoSize != h5Size {
+		return newError(
+			"refusing to read %s: HDF5 reports %d byte(s)/element but the "+
+				"Go buffer assumes %d; reading would overflow the buffer "+
+				"and corrupt heap memory", context, h5Size, elemGoSize)
+	}
+	return nil
+}
+
+// elementGoType picks the Go element type from the HDF5 datatype's own
+// class and byte size, which are authoritative, rather than trusting
+// dt.GoType() alone - that mapping in the pinned binding can pick a
+// narrower Go type than the file's actual on-disk width (observed: an
+// 8-byte H5T_FLOAT mapped to Go's 4-byte float32), which would silently
+// overflow the read buffer. GoType() is still consulted, but only to
+// tell int from uint - never for width.
+func elementGoType(dt *hdf5.Datatype) reflect.Type {
+	size := int(dt.Size())
+	switch dt.Class() {
+	case hdf5.T_FLOAT:
+		switch size {
+		case 4:
+			return reflect.TypeOf(float32(0))
+		case 8:
+			return reflect.TypeOf(float64(0))
+		}
+	case hdf5.T_INTEGER, hdf5.T_ENUM, hdf5.T_BITFIELD:
+		// Enums (h5py bool arrays are the common case: H5T_ENUM over a
+		// 1-byte integer base) and bitfields are integer-shaped in
+		// storage; dt.GoType() collapses all of them to a generic Go
+		// `int` in this binding, which is always platform width (8
+		// bytes here) regardless of the real on-disk width - so size
+		// must still come from dt.Size(), not from the hint's Go type.
+		unsigned := false
+		if hint := dt.GoType(); hint != nil {
+			switch hint.Kind() {
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				unsigned = true
+			}
+		}
+		switch {
+		case size == 1 && unsigned:
+			return reflect.TypeOf(uint8(0))
+		case size == 1:
+			return reflect.TypeOf(int8(0))
+		case size == 2 && unsigned:
+			return reflect.TypeOf(uint16(0))
+		case size == 2:
+			return reflect.TypeOf(int16(0))
+		case size == 4 && unsigned:
+			return reflect.TypeOf(uint32(0))
+		case size == 4:
+			return reflect.TypeOf(int32(0))
+		case size == 8 && unsigned:
+			return reflect.TypeOf(uint64(0))
+		case size == 8:
+			return reflect.TypeOf(int64(0))
+		}
+	}
+	return dt.GoType()
 }
