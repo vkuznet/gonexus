@@ -6,7 +6,7 @@
 #   make tidy     # generate/update go.sum (fixes "missing go.sum entry")
 #   make build    # go build ./...
 #   make test     # go test ./...
-#   make example  # build and run example/main.go, producing example.nxs
+#   make examples # build and run examples
 #   make fmt      # gofmt -w on all Go source
 #   make vet      # go vet ./...
 #   make clean    # remove build artifacts
@@ -98,11 +98,11 @@ check: fmt vet test
 # ---------------------------------------------------------------------------
 # Example program
 # ---------------------------------------------------------------------------
-.PHONY: example
-example: tidy
+.PHONY: examples
+examples: tidy
 	mkdir -p $(BIN_DIR)
-	$(GO) build -o $(BIN_DIR)/gonexus-example ./example
-	./$(BIN_DIR)/gonexus-example
+	$(GO) build -o $(BIN_DIR)/gonexus-io-example ./examples/io
+	$(GO) build -o $(BIN_DIR)/gonexus-reader-example ./examples/reader
 
 # ---------------------------------------------------------------------------
 # Housekeeping
@@ -122,5 +122,5 @@ help:
 	@echo "  vet      go vet ./..."
 	@echo "  fmt      gofmt -w on all .go files"
 	@echo "  check    fmt + vet + test"
-	@echo "  example  build and run example/main.go"
+	@echo "  examples build examples executables"
 	@echo "  clean    remove build artifacts"
