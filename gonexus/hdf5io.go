@@ -55,7 +55,6 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-	"unsafe"
 
 	"gonum.org/v1/hdf5"
 )
@@ -295,14 +294,16 @@ func readDatasetValue(ds *hdf5.Dataset, shape []int, name string) (interface{}, 
 	// path below, which shares the same broken low-level string handling
 	// as Dataset.Write (see the file-level comment).
 	if dt.Class() == hdf5.T_STRING {
-		// temp fix to skip unreadable values
-		if int(dt.Size()) == int(unsafe.Sizeof(uintptr(0))) {
-			return nil, "", errVariableLengthString
-		}
-		if int(dt.Size()) == int(unsafe.Sizeof(uintptr(0))) {
-			return nil, "", newError(
-				"dataset %q appears to be a variable-length HDF5 string; "+
-					"not supported for reading by this binding yet", name)
+		if dt.IsVariableStr() {
+			n := numElements(shape)
+			values, err := ds.ReadVariableLengthStrings(n)
+			if err != nil {
+				return nil, "", newError("could not read variable-length string dataset %q: %v", name, err)
+			}
+			if len(shape) == 0 {
+				return values[0], "string", nil
+			}
+			return values, "string", nil
 		}
 		return readFixedStringDataset(ds, dt, shape)
 	}
